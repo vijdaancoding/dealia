@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
 import io
 import logging
 import os
@@ -31,7 +32,7 @@ import re
 from typing import Any
 
 import httpx
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
 log = logging.getLogger("extractor")
@@ -40,6 +41,24 @@ app = FastAPI(title="ticket-attachment-extractor")
 MAX_BYTES = int(os.getenv("MAX_BYTES", 40 * 1024 * 1024))
 DOWNLOAD_TIMEOUT = float(os.getenv("DOWNLOAD_TIMEOUT", 90))
 SAMPLE_ROWS = int(os.getenv("SAMPLE_ROWS", 8))
+
+# CONFIGURE ME: required on n8n.cloud, since this service is reachable from the
+# public internet the moment it has a real URL. n8n has no network of its own
+# to hide behind there, unlike a self-hosted Docker setup on a private network.
+# Generate one long random value (`openssl rand -hex 32`) and set it as an
+# environment variable on whatever platform hosts this service; put the same
+# value in n8n's HTTP Header Auth credential attached to Extract Attachment.
+EXTRACTOR_SECRET = os.getenv("EXTRACTOR_SECRET", "")
+if not EXTRACTOR_SECRET:
+    log.warning("EXTRACTOR_SECRET is not set - /extract is running with NO "
+                "authentication. Fine for local-only testing, never for a "
+                "publicly reachable deployment (n8n.cloud requires one).")
+
+
+def require_secret(x_extractor_secret: str = Header(default="")) -> None:
+    # Constant-time compare so response timing can't leak the secret.
+    if EXTRACTOR_SECRET and not hmac.compare_digest(x_extractor_secret, EXTRACTOR_SECRET):
+        raise HTTPException(status_code=401, detail="invalid or missing X-Extractor-Secret header")
 
 # Vision captioning is optional. Without it images still contribute OCR text,
 # which on support screenshots is usually the highest-value string on the
@@ -309,7 +328,7 @@ def health() -> dict[str, Any]:
     return {"ok": True, "handlers": sorted(HANDLERS), "vision": bool(VISION_ENDPOINT)}
 
 
-@app.post("/extract")
+@app.post("/extract", dependencies=[Depends(require_secret)])
 def extract(req: ExtractRequest) -> dict[str, Any]:
     if not req.extract or not req.url:
         return {"status": "skipped", "asset_id": req.asset_id}
