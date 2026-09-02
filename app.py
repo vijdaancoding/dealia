@@ -19,6 +19,12 @@ POST /extract
 
 Always responds 200 with {"status": "ok"|"skipped"|"failed", ...} so a bad file
 never fails the n8n node and stalls a crawl.
+
+GET /media?f=<hubspot file id>&t=<MEDIA_SECRET>
+  302-redirects to a freshly-minted HubSpot signed URL for that file. This is
+  the permanent link stored in the database - see the MEDIA_SECRET comment
+  below for why it exists as a route on this service rather than a separate
+  n8n webhook.
 """
 from __future__ import annotations
 
@@ -33,6 +39,7 @@ from typing import Any
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 
 log = logging.getLogger("extractor")
@@ -59,6 +66,38 @@ def require_secret(x_extractor_secret: str = Header(default="")) -> None:
     # Constant-time compare so response timing can't leak the secret.
     if EXTRACTOR_SECRET and not hmac.compare_digest(x_extractor_secret, EXTRACTOR_SECRET):
         raise HTTPException(status_code=401, detail="invalid or missing X-Extractor-Secret header")
+
+
+# ---------------------------------------------------------------------------
+#  Media redirect: makes attachment links stored in Postgres permanent
+# ---------------------------------------------------------------------------
+# HubSpot's signed URLs expire in hours; the ones this service downloads with
+# get requested fresh every crawl, but the URLs written into hs_attachments and
+# hs_ticket_chunks.attachment_refs are meant to sit in the database for years.
+# Storing a raw signed URL there would leave every image/PDF link dead within a
+# day. This route is the fix: assemble_ticket.js stores a PERMANENT URL like
+# /media?f=<fileId>&t=<secret>, and this endpoint mints a fresh HubSpot signed
+# URL and redirects to it every single time that link is actually clicked - no
+# matter how long ago the ticket was indexed.
+#
+# This runs as a route on the SAME always-on service as /extract, rather than
+# as a separate n8n webhook workflow, specifically so there's nothing extra to
+# deploy or keep "Active" - one Render service, one thing to redeploy.
+#
+# Deliberately a SEPARATE secret from EXTRACTOR_SECRET: this one goes out in a
+# URL a browser or a person might click (query strings end up in browser
+# history, referrer headers, and server access logs), while EXTRACTOR_SECRET
+# only ever travels in a header between n8n and this service. Reusing one
+# secret for both would mean a leak of the more-exposed one compromises both.
+MEDIA_SECRET = os.getenv("MEDIA_SECRET", "")
+if not MEDIA_SECRET:
+    log.warning("MEDIA_SECRET is not set - /media is running with NO "
+                "authentication if reachable at all.")
+
+# A HubSpot private app token with files.ui_hidden.read (or equivalent) scope.
+# This is what lets /media mint a fresh signed URL independently of n8n - the
+# same kind of token n8n's own HubSpot App Token credential uses.
+HUBSPOT_APP_TOKEN = os.getenv("HUBSPOT_APP_TOKEN", "")
 
 # Vision captioning is optional. Without it images still contribute OCR text,
 # which on support screenshots is usually the highest-value string on the
@@ -137,9 +176,16 @@ def ocr_pdf(data: bytes, req: ExtractRequest) -> str:
         import pytesseract
         from pdf2image import convert_from_bytes
 
+        # last_page tells poppler itself to stop after page 20, so a 200-page
+        # scan never gets fully rasterized into memory just to keep the first
+        # 20 - without it, [:20] only truncates the PYTHON LIST after every
+        # page has already been rendered and held in memory at once, which on
+        # a large scan is enough on its own to exhaust a small container.
+        MAX_PAGES = 20
         out = []
-        for img in convert_from_bytes(data, dpi=200, fmt="png")[:20]:
+        for img in convert_from_bytes(data, dpi=200, fmt="png", last_page=MAX_PAGES):
             out.append(pytesseract.image_to_string(img))
+            del img   # each page is a full-resolution PIL Image; release it promptly
             if sum(len(o) for o in out) > req.max_chars:
                 break
         return "\n\n".join(out)
@@ -325,7 +371,45 @@ HANDLERS = {
 # ---------------------------------------------------------------------------
 @app.get("/health")
 def health() -> dict[str, Any]:
-    return {"ok": True, "handlers": sorted(HANDLERS), "vision": bool(VISION_ENDPOINT)}
+    return {"ok": True, "handlers": sorted(HANDLERS), "vision": bool(VISION_ENDPOINT),
+            "media_proxy": bool(MEDIA_SECRET and HUBSPOT_APP_TOKEN)}
+
+
+@app.get("/media", response_model=None)
+def media(f: str = "", t: str = "") -> RedirectResponse | dict[str, Any]:
+    # Query-string auth rather than a header, because the whole point of this
+    # route is to be a plain clickable link (in a browser, in a chat UI, in
+    # search results) - nothing generating that link gets to set headers.
+    if not MEDIA_SECRET or not hmac.compare_digest(t, MEDIA_SECRET):
+        raise HTTPException(status_code=403, detail="invalid or missing token")
+    if not re.fullmatch(r"\d+", f):
+        raise HTTPException(status_code=400, detail="invalid file id")
+    if not HUBSPOT_APP_TOKEN:
+        raise HTTPException(status_code=500, detail="HUBSPOT_APP_TOKEN not configured")
+
+    try:
+        with httpx.Client(timeout=15) as client:
+            r = client.get(
+                f"https://api.hubapi.com/files/v3/files/{f}/signed-url",
+                params={"expirationSeconds": 300},
+                headers={"Authorization": f"Bearer {HUBSPOT_APP_TOKEN}"},
+            )
+    except Exception as exc:                      # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"hubspot request failed: {exc}") from exc
+
+    if r.status_code == 404:
+        raise HTTPException(status_code=404, detail="file not found")
+    if r.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"hubspot returned {r.status_code}")
+
+    url = r.json().get("url", "")
+    if not url:
+        raise HTTPException(status_code=502, detail="hubspot response had no url")
+
+    # A short expiration is fine and safer than the crawler's 6-hour one: this
+    # URL gets used within seconds, right here in the browser that just
+    # followed the redirect - only the /media link itself is stored long-term.
+    return RedirectResponse(url=url, status_code=302)
 
 
 @app.post("/extract", dependencies=[Depends(require_secret)])
