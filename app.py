@@ -1,45 +1,18 @@
-"""
-Attachment extraction sidecar for the HubSpot ticket indexer.
-
-Why this exists as a service rather than more n8n nodes
--------------------------------------------------------
-n8n's Extract From File node covers PDF, CSV and XLSX but has no DOCX support,
-and its XLSX mode emits one item per row - which destroys the 1:1 item
-alignment the attachment lane depends on. Working around that inside n8n means
-unzipping OOXML with the Compression node and reassembling sheets from raw XML,
-which is a lot of fragile machinery to maintain.
-
-One HTTP endpoint that always returns exactly one JSON object per file keeps
-the workflow linear and puts the format-specific mess where libraries already
-solve it.
-
-POST /extract
-  {"extract": true, "url": "...", "kind": "pdf", "name": "x.pdf",
-   "extension": "pdf", "asset_id": "123__att_001", "max_chars": 40000}
-
-Always responds 200 with {"status": "ok"|"skipped"|"failed", ...} so a bad file
-never fails the n8n node and stalls a crawl.
-
-GET /media?f=<hubspot file id>&t=<MEDIA_SECRET>
-  302-redirects to a freshly-minted HubSpot signed URL for that file. This is
-  the permanent link stored in the database - see the MEDIA_SECRET comment
-  below for why it exists as a route on this service rather than a separate
-  n8n webhook.
-"""
 from __future__ import annotations
 
 import base64
+import csv as csv_module
+import gc
 import hashlib
 import hmac
 import io
 import logging
 import os
 import re
-from typing import Any
+from typing import Any, Iterable
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException
-from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 
 log = logging.getLogger("extractor")
@@ -49,55 +22,33 @@ MAX_BYTES = int(os.getenv("MAX_BYTES", 40 * 1024 * 1024))
 DOWNLOAD_TIMEOUT = float(os.getenv("DOWNLOAD_TIMEOUT", 90))
 SAMPLE_ROWS = int(os.getenv("SAMPLE_ROWS", 8))
 
-# CONFIGURE ME: required on n8n.cloud, since this service is reachable from the
-# public internet the moment it has a real URL. n8n has no network of its own
-# to hide behind there, unlike a self-hosted Docker setup on a private network.
-# Generate one long random value (`openssl rand -hex 32`) and set it as an
-# environment variable on whatever platform hosts this service; put the same
-# value in n8n's HTTP Header Auth credential attached to Extract Attachment.
+# Bounds that exist purely to keep peak memory predictable on a small box.
+MAX_PDF_PAGES = int(os.getenv("MAX_PDF_PAGES", 100))     # text extraction
+MAX_OCR_PAGES = int(os.getenv("MAX_OCR_PAGES", 20))      # rasterised OCR
+MAX_SHEETS = int(os.getenv("MAX_SHEETS", 12))
+MAX_COLS = int(os.getenv("MAX_COLS", 40))
+MAX_ROWS_SCANNED = int(os.getenv("MAX_ROWS_SCANNED", 20000))
+# tesseract's footprint tracks pixel count, not file size: a 12 MP phone photo
+# costs far more than a 1 MP screenshot of the same byte length.
+MAX_OCR_PIXELS = int(os.getenv("MAX_OCR_PIXELS", 4_000_000))
+# What gets base64'd and sent to the vision endpoint. Downscaling first keeps
+# the encoded copy small - base64 inflates by ~33% and the whole string is
+# held in memory for the duration of the request.
+MAX_VISION_PIXELS = int(os.getenv("MAX_VISION_PIXELS", 1_200_000))
+
 EXTRACTOR_SECRET = os.getenv("EXTRACTOR_SECRET", "")
 if not EXTRACTOR_SECRET:
     log.warning("EXTRACTOR_SECRET is not set - /extract is running with NO "
                 "authentication. Fine for local-only testing, never for a "
-                "publicly reachable deployment (n8n.cloud requires one).")
+                "publicly reachable deployment.")
 
 
 def require_secret(x_extractor_secret: str = Header(default="")) -> None:
     # Constant-time compare so response timing can't leak the secret.
     if EXTRACTOR_SECRET and not hmac.compare_digest(x_extractor_secret, EXTRACTOR_SECRET):
-        raise HTTPException(status_code=401, detail="invalid or missing X-Extractor-Secret header")
+        raise HTTPException(status_code=401,
+                            detail="invalid or missing X-Extractor-Secret header")
 
-
-# ---------------------------------------------------------------------------
-#  Media redirect: makes attachment links stored in Postgres permanent
-# ---------------------------------------------------------------------------
-# HubSpot's signed URLs expire in hours; the ones this service downloads with
-# get requested fresh every crawl, but the URLs written into hs_attachments and
-# hs_ticket_chunks.attachment_refs are meant to sit in the database for years.
-# Storing a raw signed URL there would leave every image/PDF link dead within a
-# day. This route is the fix: assemble_ticket.js stores a PERMANENT URL like
-# /media?f=<fileId>&t=<secret>, and this endpoint mints a fresh HubSpot signed
-# URL and redirects to it every single time that link is actually clicked - no
-# matter how long ago the ticket was indexed.
-#
-# This runs as a route on the SAME always-on service as /extract, rather than
-# as a separate n8n webhook workflow, specifically so there's nothing extra to
-# deploy or keep "Active" - one Render service, one thing to redeploy.
-#
-# Deliberately a SEPARATE secret from EXTRACTOR_SECRET: this one goes out in a
-# URL a browser or a person might click (query strings end up in browser
-# history, referrer headers, and server access logs), while EXTRACTOR_SECRET
-# only ever travels in a header between n8n and this service. Reusing one
-# secret for both would mean a leak of the more-exposed one compromises both.
-MEDIA_SECRET = os.getenv("MEDIA_SECRET", "")
-if not MEDIA_SECRET:
-    log.warning("MEDIA_SECRET is not set - /media is running with NO "
-                "authentication if reachable at all.")
-
-# A HubSpot private app token with files.ui_hidden.read (or equivalent) scope.
-# This is what lets /media mint a fresh signed URL independently of n8n - the
-# same kind of token n8n's own HubSpot App Token credential uses.
-HUBSPOT_APP_TOKEN = os.getenv("HUBSPOT_APP_TOKEN", "")
 
 # Vision captioning is optional. Without it images still contribute OCR text,
 # which on support screenshots is usually the highest-value string on the
@@ -130,39 +81,60 @@ def _clean(text: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
+def _decode(raw: bytes) -> str:
+    for enc in ("utf-8", "utf-16", "latin-1"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
 # ---------------------------------------------------------------------------
-#  Format handlers
+#  PDF
 # ---------------------------------------------------------------------------
-def extract_pdf(data: bytes, req: ExtractRequest) -> dict[str, Any]:
+def extract_pdf(buf: io.BytesIO, req: ExtractRequest) -> dict[str, Any]:
     import pdfplumber
 
-    pages, tables_found = [], 0
-    with pdfplumber.open(io.BytesIO(data)) as pdf:
+    pages: list[str] = []
+    tables_found = 0
+    chars = 0
+
+    with pdfplumber.open(buf) as pdf:
         n_pages = len(pdf.pages)
-        for i, page in enumerate(pdf.pages, 1):
-            body = page.extract_text() or ""
-            # Tables extracted as pipe rows survive chunking far better than
-            # the whitespace-aligned text pdfplumber returns by default.
-            for tbl in page.extract_tables() or []:
-                tables_found += 1
-                rows = [
-                    " | ".join((c or "").strip() for c in row)
-                    for row in tbl[:40]
-                ]
-                body += "\n\n" + "\n".join(rows)
+        for i, page in enumerate(pdf.pages[:MAX_PDF_PAGES], 1):
+            try:
+                body = page.extract_text() or ""
+                # Pipe rows survive chunking far better than the
+                # whitespace-aligned text pdfplumber returns by default.
+                for tbl in page.extract_tables() or []:
+                    tables_found += 1
+                    body += "\n\n" + "\n".join(
+                        " | ".join((c or "").strip() for c in row) for row in tbl[:40]
+                    )
+            finally:
+                # pdfplumber caches parsed objects per page; without this a
+                # long PDF holds every page it has touched in memory at once.
+                page.flush_cache()
+
             if body.strip():
                 # The page marker lets a retrieved chunk tell the reader where
                 # in a 40-page statement the text came from.
                 pages.append(f"[page {i}]\n{body.strip()}")
-            if sum(len(p) for p in pages) > req.max_chars:
+                chars += len(body)
+            if chars > req.max_chars:
                 break
 
     text = _clean("\n\n".join(pages))
-    scanned = len(text) < 40 * max(1, n_pages) // 10
+    del pages
 
-    # A PDF with almost no extractable text is a scan. OCR it instead.
+    # A real scan has essentially NO text layer - not merely sparse text. Keep
+    # this threshold low: a false positive here silently costs a full OCR pass
+    # (the most expensive thing this service does) on a PDF that already had
+    # perfectly good text, e.g. a short cover letter or a title page.
+    scanned = chars < 20 * max(1, min(n_pages, MAX_PDF_PAGES))
     if scanned:
-        ocr = ocr_pdf(data, req)
+        ocr = _ocr_pdf(buf, req)
         if ocr:
             return {"status": "ok", "text": _clean(ocr)[: req.max_chars],
                     "pages": n_pages, "ocr_chars": len(ocr), "scanned": True}
@@ -171,34 +143,48 @@ def extract_pdf(data: bytes, req: ExtractRequest) -> dict[str, Any]:
             "tables_found": tables_found, "scanned": False}
 
 
-def ocr_pdf(data: bytes, req: ExtractRequest) -> str:
+def _ocr_pdf(buf: io.BytesIO, req: ExtractRequest) -> str:
     try:
         import pytesseract
         from pdf2image import convert_from_bytes
 
-        # last_page tells poppler itself to stop after page 20, so a 200-page
-        # scan never gets fully rasterized into memory just to keep the first
-        # 20 - without it, [:20] only truncates the PYTHON LIST after every
-        # page has already been rendered and held in memory at once, which on
-        # a large scan is enough on its own to exhaust a small container.
-        MAX_PAGES = 20
-        out = []
-        for img in convert_from_bytes(data, dpi=200, fmt="png", last_page=MAX_PAGES):
-            out.append(pytesseract.image_to_string(img))
-            del img   # each page is a full-resolution PIL Image; release it promptly
-            if sum(len(o) for o in out) > req.max_chars:
+        buf.seek(0)
+        data = buf.read()
+        out: list[str] = []
+        total = 0
+        # first_page/last_page make poppler itself stop early. Rasterising the
+        # whole document and then slicing in Python would hold every page in
+        # memory at once, which is enough on its own to OOM a small container.
+        for start in range(1, MAX_OCR_PAGES + 1):
+            imgs = convert_from_bytes(data, dpi=150, fmt="png",
+                                      first_page=start, last_page=start)
+            if not imgs:
                 break
+            img = imgs[0]
+            try:
+                page_text = pytesseract.image_to_string(img)
+            finally:
+                img.close()
+                del imgs, img
+            out.append(page_text)
+            total += len(page_text)
+            if total > req.max_chars:
+                break
+        del data
         return "\n\n".join(out)
     except Exception as exc:                      # noqa: BLE001
         log.warning("pdf ocr failed for %s: %s", req.asset_id, exc)
         return ""
 
 
-def extract_docx(data: bytes, req: ExtractRequest) -> dict[str, Any]:
+# ---------------------------------------------------------------------------
+#  Word
+# ---------------------------------------------------------------------------
+def extract_docx(buf: io.BytesIO, req: ExtractRequest) -> dict[str, Any]:
     import docx
 
-    d = docx.Document(io.BytesIO(data))
-    parts = []
+    d = docx.Document(buf)
+    parts: list[str] = []
     for p in d.paragraphs:
         t = p.text.strip()
         if not t:
@@ -214,76 +200,147 @@ def extract_docx(data: bytes, req: ExtractRequest) -> dict[str, Any]:
         else:
             parts.append(t)
 
+    n_tables = len(d.tables)
     for tbl in d.tables:
         rows = [" | ".join(c.text.strip() for c in row.cells) for row in tbl.rows[:60]]
         if rows:
             parts.append("\n".join(rows))
 
+    n_paras = len(d.paragraphs)
+    del d
     return {"status": "ok", "text": _clean("\n\n".join(parts))[: req.max_chars],
-            "paragraphs": len(d.paragraphs), "tables_found": len(d.tables)}
+            "paragraphs": n_paras, "tables_found": n_tables}
 
 
-def extract_spreadsheet(data: bytes, req: ExtractRequest) -> dict[str, Any]:
-    """Summarise structure; never dump every cell.
+# ---------------------------------------------------------------------------
+#  Spreadsheets - structure, not cells
+# ---------------------------------------------------------------------------
+# A 400-row export embedded cell by cell produces vectors dominated by numbers
+# and retrieves for nothing. What people search for is the shape: which sheet,
+# which columns, roughly what magnitude.
+def _as_number(v: Any) -> float | None:
+    if isinstance(v, bool) or v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    s = str(v).strip().replace(",", "")
+    if not s:
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        return None
 
-    A 400-row export embedded cell by cell produces vectors dominated by
-    numbers and retrieves for nothing. What people actually search for is the
-    shape: which sheet, which columns, roughly what magnitude.
-    """
-    import pandas as pd
 
-    ext = (req.extension or "").lower()
-    if ext in ("csv", "tsv"):
-        sep = "\t" if ext == "tsv" else ","
-        sheets = {"Sheet1": pd.read_csv(io.BytesIO(data), sep=sep,
-                                        dtype=str, on_bad_lines="skip",
-                                        nrows=100_000)}
-    else:
-        sheets = pd.read_excel(io.BytesIO(data), sheet_name=None, dtype=object)
+def _summarise_rows(rows: Iterable[Any], sheet_name: str) -> dict[str, Any] | None:
+    """Single streaming pass: headers, sample, per-column stats. Never holds
+    more than SAMPLE_ROWS rows at a time regardless of sheet size."""
+    headers: list[str] = []
+    sample: list[list[str]] = []
+    stats: dict[str, dict[str, float]] = {}
+    numeric_n: dict[str, int] = {}
+    n_rows = 0
 
-    tables, blurbs = [], []
-    for sheet_name, df in list(sheets.items())[:12]:
-        df = df.dropna(axis=0, how="all").dropna(axis=1, how="all")
-        if df.empty:
+    for idx, row in enumerate(rows):
+        vals = list(row)[:MAX_COLS]
+        if idx == 0:
+            headers = [str(v).strip() if v is not None and str(v).strip() else f"col{i+1}"
+                       for i, v in enumerate(vals)]
             continue
-        headers = [str(c) for c in df.columns][:40]
+        if not headers:
+            break
+        if all(v is None or not str(v).strip() for v in vals):
+            continue
 
-        col_types, numeric = {}, {}
-        for col in df.columns[:40]:
-            series = pd.to_numeric(df[col], errors="coerce")
-            if series.notna().sum() >= max(3, 0.6 * len(df)):
-                col_types[str(col)] = "number"
-                numeric[str(col)] = {
-                    "min": round(float(series.min()), 4),
-                    "max": round(float(series.max()), 4),
-                    "sum": round(float(series.sum()), 4),
-                }
+        n_rows += 1
+        if len(sample) < SAMPLE_ROWS:
+            sample.append([("" if v is None else str(v))[:60] for v in vals])
+
+        for i, v in enumerate(vals[: len(headers)]):
+            num = _as_number(v)
+            if num is None:
+                continue
+            key = headers[i]
+            s = stats.get(key)
+            if s is None:
+                stats[key] = {"min": num, "max": num, "sum": num}
             else:
-                col_types[str(col)] = "text"
+                if num < s["min"]:
+                    s["min"] = num
+                if num > s["max"]:
+                    s["max"] = num
+                s["sum"] += num
+            numeric_n[key] = numeric_n.get(key, 0) + 1
 
-        sample = df.head(SAMPLE_ROWS).astype(str)
-        md = ["| " + " | ".join(headers) + " |",
-              "| " + " | ".join("---" for _ in headers) + " |"]
-        for _, row in sample.iterrows():
-            md.append("| " + " | ".join(str(v)[:60] for v in row.tolist()[:40]) + " |")
+        if n_rows >= MAX_ROWS_SCANNED:
+            break
 
-        tables.append({
-            "sheet": str(sheet_name), "rows": int(len(df)), "cols": int(df.shape[1]),
+    if not headers or not n_rows:
+        return None
+
+    # A column counts as numeric only if most of its values parsed as numbers -
+    # otherwise a text column with a few stray digits would report a bogus sum.
+    threshold = max(3, int(0.6 * n_rows))
+    col_types = {h: ("number" if numeric_n.get(h, 0) >= threshold else "text")
+                 for h in headers}
+    numeric_summary = {h: {"min": round(s["min"], 4),
+                           "max": round(s["max"], 4),
+                           "sum": round(s["sum"], 4)}
+                       for h, s in stats.items() if col_types.get(h) == "number"}
+
+    md = ["| " + " | ".join(headers) + " |",
+          "| " + " | ".join("---" for _ in headers) + " |"]
+    for r in sample:
+        cells = (r + [""] * len(headers))[: len(headers)]
+        md.append("| " + " | ".join(cells) + " |")
+
+    return {"sheet": str(sheet_name), "rows": n_rows, "cols": len(headers),
             "headers": headers, "column_types": col_types,
-            "numeric_summary": numeric, "sample_markdown": "\n".join(md),
-        })
-        blurbs.append(f'Sheet "{sheet_name}": {len(df)} rows x {df.shape[1]} columns. '
-                      f'Columns: {", ".join(headers)}.')
+            "numeric_summary": numeric_summary, "sample_markdown": "\n".join(md)}
+
+
+def extract_spreadsheet(buf: io.BytesIO, req: ExtractRequest) -> dict[str, Any]:
+    ext = (req.extension or "").lower()
+    tables: list[dict[str, Any]] = []
+
+    if ext in ("csv", "tsv"):
+        buf.seek(0)
+        text = _decode(buf.read())
+        reader = csv_module.reader(io.StringIO(text),
+                                   delimiter="\t" if ext == "tsv" else ",")
+        summary = _summarise_rows(reader, "Sheet1")
+        del text
+        if summary:
+            tables.append(summary)
+    else:
+        import openpyxl
+
+        # read_only streams rows off disk instead of building a full in-memory
+        # object graph; data_only skips formula ASTs and returns cached values.
+        wb = openpyxl.load_workbook(buf, read_only=True, data_only=True)
+        try:
+            for ws in list(wb.worksheets)[:MAX_SHEETS]:
+                summary = _summarise_rows(ws.iter_rows(values_only=True), ws.title)
+                if summary:
+                    tables.append(summary)
+        finally:
+            wb.close()
+
+    blurbs = [f'Sheet "{t["sheet"]}": {t["rows"]} rows x {t["cols"]} columns. '
+              f'Columns: {", ".join(t["headers"])}.' for t in tables]
 
     return {"status": "ok", "text": _clean("\n".join(blurbs))[: req.max_chars],
             "tables": tables, "sheets": len(tables)}
 
 
-def extract_pptx(data: bytes, req: ExtractRequest) -> dict[str, Any]:
+# ---------------------------------------------------------------------------
+#  Slides
+# ---------------------------------------------------------------------------
+def extract_pptx(buf: io.BytesIO, req: ExtractRequest) -> dict[str, Any]:
     from pptx import Presentation
 
-    prs = Presentation(io.BytesIO(data))
-    parts = []
+    prs = Presentation(buf)
+    parts: list[str] = []
     for i, slide in enumerate(prs.slides, 1):
         bits = [sh.text.strip() for sh in slide.shapes
                 if getattr(sh, "has_text_frame", False) and sh.text.strip()]
@@ -293,24 +350,44 @@ def extract_pptx(data: bytes, req: ExtractRequest) -> dict[str, Any]:
         if bits or notes:
             parts.append(f"[slide {i}]\n" + "\n".join(bits)
                          + (f"\nSpeaker notes: {notes}" if notes else ""))
+    n_slides = len(prs.slides)
+    del prs
     return {"status": "ok", "text": _clean("\n\n".join(parts))[: req.max_chars],
-            "pages": len(prs.slides)}
+            "pages": n_slides}
 
 
-def extract_image(data: bytes, req: ExtractRequest) -> dict[str, Any]:
+# ---------------------------------------------------------------------------
+#  Images
+# ---------------------------------------------------------------------------
+def extract_image(buf: io.BytesIO, req: ExtractRequest) -> dict[str, Any]:
     ocr_text, vision = "", ""
 
     try:
         import pytesseract
         from PIL import Image
 
-        img = Image.open(io.BytesIO(data))
-        if img.mode not in ("RGB", "L"):
-            img = img.convert("RGB")
-        # Upscaling small screenshots measurably improves OCR on UI fonts.
-        if max(img.size) < 1000:
-            img = img.resize((img.width * 2, img.height * 2))
-        ocr_text = _clean(pytesseract.image_to_string(img))
+        # Refuse absurd dimensions outright rather than letting PIL allocate
+        # first and fail second (decompression-bomb guard).
+        Image.MAX_IMAGE_PIXELS = 64_000_000
+
+        buf.seek(0)
+        with Image.open(buf) as img:
+            if img.mode not in ("RGB", "L"):
+                img = img.convert("RGB")
+
+            w, h = img.size
+            if w * h > MAX_OCR_PIXELS:
+                # thumbnail() resizes in place and never enlarges, so it is
+                # both the cheap and the safe way to land under the budget.
+                img.thumbnail((int(MAX_OCR_PIXELS ** 0.5), int(MAX_OCR_PIXELS ** 0.5)))
+            elif max(w, h) < 1000:
+                # Upscaling small screenshots measurably improves OCR on UI
+                # fonts - but only when the result stays inside the budget.
+                if (w * 2) * (h * 2) <= MAX_OCR_PIXELS:
+                    img = img.resize((w * 2, h * 2))
+
+            ocr_text = _clean(pytesseract.image_to_string(img))
+
         # Tesseract returns punctuation soup on photos and gradients; drop
         # anything without a run of real words rather than indexing noise.
         if len(re.findall(r"[A-Za-z]{3,}", ocr_text)) < 3:
@@ -320,7 +397,7 @@ def extract_image(data: bytes, req: ExtractRequest) -> dict[str, Any]:
 
     if VISION_ENDPOINT and VISION_KEY:
         try:
-            vision = caption_image(data, req)
+            vision = _caption_image(buf, req)
         except Exception as exc:                  # noqa: BLE001
             log.warning("vision failed for %s: %s", req.asset_id, exc)
 
@@ -328,18 +405,36 @@ def extract_image(data: bytes, req: ExtractRequest) -> dict[str, Any]:
             "ocr_chars": len(ocr_text), "vision_description": vision}
 
 
-def caption_image(data: bytes, req: ExtractRequest) -> str:
-    mime = {"png": "image/png", "gif": "image/gif", "webp": "image/webp"}.get(
-        (req.extension or "").lower(), "image/jpeg")
-    b64 = base64.b64encode(data).decode()
+def _caption_image(buf: io.BytesIO, req: ExtractRequest) -> str:
+    from PIL import Image
+
+    # Downscale and re-encode as JPEG before base64. Sending the original would
+    # hold the raw bytes, a base64 string ~33% larger, and the JSON payload
+    # containing it all at once - on a large PNG that is the single biggest
+    # allocation this service makes.
+    buf.seek(0)
+    small = io.BytesIO()
+    with Image.open(buf) as img:
+        if img.mode not in ("RGB", "L"):
+            img = img.convert("RGB")
+        if img.size[0] * img.size[1] > MAX_VISION_PIXELS:
+            side = int(MAX_VISION_PIXELS ** 0.5)
+            img.thumbnail((side, side))
+        img.convert("RGB").save(small, format="JPEG", quality=80, optimize=True)
+
+    b64 = base64.b64encode(small.getbuffer()).decode()
+    del small
+
     payload = {
         "temperature": 0,
         "max_tokens": 400,
         "messages": [{"role": "user", "content": [
             {"type": "text", "text": VISION_PROMPT},
-            {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
         ]}],
     }
+    del b64
+
     with httpx.Client(timeout=120) as client:
         r = client.post(VISION_ENDPOINT, json=payload,
                         headers={"api-key": VISION_KEY,
@@ -348,14 +443,12 @@ def caption_image(data: bytes, req: ExtractRequest) -> str:
         return _clean(r.json()["choices"][0]["message"]["content"])
 
 
-def extract_text(data: bytes, req: ExtractRequest) -> dict[str, Any]:
-    for enc in ("utf-8", "utf-16", "latin-1"):
-        try:
-            return {"status": "ok",
-                    "text": _clean(data.decode(enc))[: req.max_chars]}
-        except UnicodeDecodeError:
-            continue
-    return {"status": "failed", "error": "undecodable text file"}
+# ---------------------------------------------------------------------------
+#  Plain text
+# ---------------------------------------------------------------------------
+def extract_text(buf: io.BytesIO, req: ExtractRequest) -> dict[str, Any]:
+    buf.seek(0)
+    return {"status": "ok", "text": _clean(_decode(buf.read()))[: req.max_chars]}
 
 
 HANDLERS = {
@@ -371,45 +464,35 @@ HANDLERS = {
 # ---------------------------------------------------------------------------
 @app.get("/health")
 def health() -> dict[str, Any]:
-    return {"ok": True, "handlers": sorted(HANDLERS), "vision": bool(VISION_ENDPOINT),
-            "media_proxy": bool(MEDIA_SECRET and HUBSPOT_APP_TOKEN)}
+    return {"ok": True, "handlers": sorted(HANDLERS), "vision": bool(VISION_ENDPOINT)}
 
 
-@app.get("/media", response_model=None)
-def media(f: str = "", t: str = "") -> RedirectResponse | dict[str, Any]:
-    # Query-string auth rather than a header, because the whole point of this
-    # route is to be a plain clickable link (in a browser, in a chat UI, in
-    # search results) - nothing generating that link gets to set headers.
-    if not MEDIA_SECRET or not hmac.compare_digest(t, MEDIA_SECRET):
-        raise HTTPException(status_code=403, detail="invalid or missing token")
-    if not re.fullmatch(r"\d+", f):
-        raise HTTPException(status_code=400, detail="invalid file id")
-    if not HUBSPOT_APP_TOKEN:
-        raise HTTPException(status_code=500, detail="HUBSPOT_APP_TOKEN not configured")
+class _TooBig(Exception):
+    pass
 
-    try:
-        with httpx.Client(timeout=15) as client:
-            r = client.get(
-                f"https://api.hubapi.com/files/v3/files/{f}/signed-url",
-                params={"expirationSeconds": 300},
-                headers={"Authorization": f"Bearer {HUBSPOT_APP_TOKEN}"},
-            )
-    except Exception as exc:                      # noqa: BLE001
-        raise HTTPException(status_code=502, detail=f"hubspot request failed: {exc}") from exc
 
-    if r.status_code == 404:
-        raise HTTPException(status_code=404, detail="file not found")
-    if r.status_code != 200:
-        raise HTTPException(status_code=502, detail=f"hubspot returned {r.status_code}")
+def _download(url: str) -> tuple[io.BytesIO, str, int]:
+    """Stream to one buffer, hashing as we go.
 
-    url = r.json().get("url", "")
-    if not url:
-        raise HTTPException(status_code=502, detail="hubspot response had no url")
-
-    # A short expiration is fine and safer than the crawler's 6-hour one: this
-    # URL gets used within seconds, right here in the browser that just
-    # followed the redirect - only the /media link itself is stored long-term.
-    return RedirectResponse(url=url, status_code=302)
+    The hash is computed from the chunks in flight rather than from the
+    finished bytes, so the file never needs to exist twice in memory - the
+    previous version's buf.getvalue() silently doubled peak usage for every
+    single attachment.
+    """
+    digest = hashlib.sha256()
+    buf = io.BytesIO()
+    size = 0
+    with httpx.Client(timeout=DOWNLOAD_TIMEOUT, follow_redirects=True) as client:
+        with client.stream("GET", url) as resp:
+            resp.raise_for_status()
+            for chunk in resp.iter_bytes(65536):
+                size += len(chunk)
+                if size > MAX_BYTES:
+                    raise _TooBig
+                digest.update(chunk)
+                buf.write(chunk)
+    buf.seek(0)
+    return buf, digest.hexdigest(), size
 
 
 @app.post("/extract", dependencies=[Depends(require_secret)])
@@ -426,36 +509,36 @@ def extract(req: ExtractRequest) -> dict[str, Any]:
     # but a non-2xx would still burn its retries and slow the crawl for a file
     # that is never going to parse.
     try:
-        with httpx.Client(timeout=DOWNLOAD_TIMEOUT, follow_redirects=True) as client:
-            with client.stream("GET", req.url) as resp:
-                resp.raise_for_status()
-                buf = io.BytesIO()
-                for chunk in resp.iter_bytes(65536):
-                    buf.write(chunk)
-                    if buf.tell() > MAX_BYTES:
-                        return {"status": "skipped", "asset_id": req.asset_id,
-                                "error": "exceeds MAX_BYTES"}
-                data = buf.getvalue()
+        buf, content_hash, size = _download(req.url)
+    except _TooBig:
+        return {"status": "skipped", "asset_id": req.asset_id,
+                "error": "exceeds MAX_BYTES"}
     except Exception as exc:                      # noqa: BLE001
         return {"status": "failed", "asset_id": req.asset_id,
                 "error": f"download: {exc}"[:300]}
 
-    if not data:
+    if not size:
         return {"status": "failed", "asset_id": req.asset_id, "error": "empty file"}
 
     try:
-        result = handler(data, req)
+        result = handler(buf, req)
     except Exception as exc:                      # noqa: BLE001
         log.exception("extract failed for %s", req.asset_id)
         return {"status": "failed", "asset_id": req.asset_id,
                 "error": f"{type(exc).__name__}: {exc}"[:300]}
+    finally:
+        buf.close()
+        del buf
+        # One worker serving one ticket at a time means peak RSS is what
+        # matters, not throughput. Returning pages promptly keeps the next
+        # attachment from starting on top of this one's leftovers.
+        gc.collect()
 
     result.setdefault("status", "ok")
     result["asset_id"] = req.asset_id
-    result["size_bytes"] = len(data)
-    # Same physical file can arrive under different HubSpot file IDs - most
-    # commonly a screenshot pasted into an email that gets re-uploaded fresh
-    # every time the thread is quoted forward. A byte-exact hash is what
-    # Assemble Ticket uses to collapse those back into one indexed asset.
-    result["content_hash"] = hashlib.sha256(data).hexdigest()
+    result["size_bytes"] = size
+    # The same physical file arrives under different HubSpot file IDs when a
+    # pasted screenshot gets re-uploaded on each re-quote; Assemble Ticket uses
+    # this hash to collapse those into one indexed asset.
+    result["content_hash"] = content_hash
     return result
