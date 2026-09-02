@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import base64
 import csv as csv_module
 import gc
 import hashlib
@@ -23,18 +22,41 @@ DOWNLOAD_TIMEOUT = float(os.getenv("DOWNLOAD_TIMEOUT", 90))
 SAMPLE_ROWS = int(os.getenv("SAMPLE_ROWS", 8))
 
 # Bounds that exist purely to keep peak memory predictable on a small box.
-MAX_PDF_PAGES = int(os.getenv("MAX_PDF_PAGES", 100))     # text extraction
-MAX_OCR_PAGES = int(os.getenv("MAX_OCR_PAGES", 20))      # rasterised OCR
+MAX_PDF_PAGES = int(os.getenv("MAX_PDF_PAGES", 100))
 MAX_SHEETS = int(os.getenv("MAX_SHEETS", 12))
 MAX_COLS = int(os.getenv("MAX_COLS", 40))
 MAX_ROWS_SCANNED = int(os.getenv("MAX_ROWS_SCANNED", 20000))
-# tesseract's footprint tracks pixel count, not file size: a 12 MP phone photo
-# costs far more than a 1 MP screenshot of the same byte length.
-MAX_OCR_PIXELS = int(os.getenv("MAX_OCR_PIXELS", 4_000_000))
-# What gets base64'd and sent to the vision endpoint. Downscaling first keeps
-# the encoded copy small - base64 inflates by ~33% and the whole string is
-# held in memory for the duration of the request.
-MAX_VISION_PIXELS = int(os.getenv("MAX_VISION_PIXELS", 1_200_000))
+
+# ---------------------------------------------------------------------------
+#  Scanned-PDF OCR via OCR.space
+# ---------------------------------------------------------------------------
+# OCR is the one thing that genuinely cannot be done cheaply in-process: doing
+# it locally means tesseract plus rasterising every page to a bitmap, which is
+# what was spiking memory hard enough to get this worker OOM-killed. Handing it
+# to an HTTP API moves that entire cost off this container - the request holds
+# one file's bytes and waits, nothing more.
+#
+# Applies to SCANNED PDFs ONLY. Images are never sent anywhere; see HANDLERS.
+# Leave OCR_SPACE_API_KEY unset to disable: scanned PDFs then return empty text
+# with scanned=true, which is honest and still visible in v_extraction_health.
+OCR_SPACE_API_KEY = os.getenv("OCR_SPACE_API_KEY", "")
+OCR_SPACE_URL = os.getenv("OCR_SPACE_URL", "https://api.ocr.space/parse/image")
+# The free tier rejects anything over 1 MB. Checking locally first turns a
+# guaranteed API rejection into a cheap, clearly-labelled skip.
+OCR_SPACE_MAX_BYTES = int(os.getenv("OCR_SPACE_MAX_BYTES", 1024 * 1024))
+# Engine 2 handles rotated and lower-quality scans noticeably better than the
+# default; both are available on the free tier.
+OCR_SPACE_ENGINE = os.getenv("OCR_SPACE_ENGINE", "2")
+OCR_SPACE_LANGUAGE = os.getenv("OCR_SPACE_LANGUAGE", "eng")
+OCR_SPACE_TIMEOUT = float(os.getenv("OCR_SPACE_TIMEOUT", 120))
+# Total pages OCR'd per document. A 200-page scan is not worth 60+ API calls
+# against a 500/day free quota; the first pages carry the useful content.
+OCR_SPACE_MAX_PAGES = int(os.getenv("OCR_SPACE_MAX_PAGES", 20))
+# Pages per request. The free tier only reads the first few pages of any one
+# PDF, so batching more than this silently drops the remainder.
+OCR_SPACE_MAX_PAGES_PER_REQUEST = int(os.getenv("OCR_SPACE_MAX_PAGES_PER_REQUEST", 3))
+# Ceiling on the file we're willing to load into pypdf in order to split it.
+OCR_SPACE_SPLIT_MAX_BYTES = int(os.getenv("OCR_SPACE_SPLIT_MAX_BYTES", 20 * 1024 * 1024))
 
 EXTRACTOR_SECRET = os.getenv("EXTRACTOR_SECRET", "")
 if not EXTRACTOR_SECRET:
@@ -48,20 +70,6 @@ def require_secret(x_extractor_secret: str = Header(default="")) -> None:
     if EXTRACTOR_SECRET and not hmac.compare_digest(x_extractor_secret, EXTRACTOR_SECRET):
         raise HTTPException(status_code=401,
                             detail="invalid or missing X-Extractor-Secret header")
-
-
-# Vision captioning is optional. Without it images still contribute OCR text,
-# which on support screenshots is usually the highest-value string on the
-# ticket - the literal error message.
-VISION_ENDPOINT = os.getenv("VISION_ENDPOINT", "")
-VISION_KEY = os.getenv("VISION_KEY", "")
-VISION_PROMPT = (
-    "This is an attachment from a customer support ticket. In 2-3 sentences, "
-    "describe what it shows: the product screen or document type, any error or "
-    "warning message (quote error text exactly), what is highlighted or circled, "
-    "and any visible identifiers such as record IDs or dates. If it is a photo "
-    "rather than a screenshot, say so. Do not speculate beyond what is visible."
-)
 
 
 class ExtractRequest(BaseModel):
@@ -128,58 +136,186 @@ def extract_pdf(buf: io.BytesIO, req: ExtractRequest) -> dict[str, Any]:
     text = _clean("\n\n".join(pages))
     del pages
 
-    # A real scan has essentially NO text layer - not merely sparse text. Keep
-    # this threshold low: a false positive here silently costs a full OCR pass
-    # (the most expensive thing this service does) on a PDF that already had
-    # perfectly good text, e.g. a short cover letter or a title page.
+    # A scanned PDF has essentially NO text layer. Hand it to OCR.space rather
+    # than OCRing locally - see the OCR_SPACE_API_KEY comment above.
     scanned = chars < 20 * max(1, min(n_pages, MAX_PDF_PAGES))
+
     if scanned:
-        ocr = _ocr_pdf(buf, req)
-        if ocr:
-            return {"status": "ok", "text": _clean(ocr)[: req.max_chars],
-                    "pages": n_pages, "ocr_chars": len(ocr), "scanned": True}
+        ocr_text, ocr_status = _ocr_scanned_pdf(buf, req)
+        if ocr_text:
+            return {"status": "ok", "text": _clean(ocr_text)[: req.max_chars],
+                    "pages": n_pages, "scanned": True,
+                    "ocr_chars": len(ocr_text), "ocr_status": ocr_status,
+                    "ocr_provider": "ocr.space", "needs_ocr": False}
+        # No text from OCR.space (not configured, too large, rate-limited, or
+        # it simply found nothing). needs_ocr tells the workflow it may still be
+        # worth trying its own LLM fallback - that call has to happen in n8n
+        # because the model credential lives there, not in this container.
+        return {"status": "ok", "text": "", "pages": n_pages, "scanned": True,
+                "ocr_chars": 0, "ocr_status": ocr_status, "needs_ocr": True}
 
     return {"status": "ok", "text": text[: req.max_chars], "pages": n_pages,
-            "tables_found": tables_found, "scanned": False}
+            "tables_found": tables_found, "scanned": scanned}
 
-
-def _ocr_pdf(buf: io.BytesIO, req: ExtractRequest) -> str:
-    try:
-        import pytesseract
-        from pdf2image import convert_from_bytes
-
-        buf.seek(0)
-        data = buf.read()
-        out: list[str] = []
-        total = 0
-        # first_page/last_page make poppler itself stop early. Rasterising the
-        # whole document and then slicing in Python would hold every page in
-        # memory at once, which is enough on its own to OOM a small container.
-        for start in range(1, MAX_OCR_PAGES + 1):
-            imgs = convert_from_bytes(data, dpi=150, fmt="png",
-                                      first_page=start, last_page=start)
-            if not imgs:
-                break
-            img = imgs[0]
-            try:
-                page_text = pytesseract.image_to_string(img)
-            finally:
-                img.close()
-                del imgs, img
-            out.append(page_text)
-            total += len(page_text)
-            if total > req.max_chars:
-                break
-        del data
-        return "\n\n".join(out)
-    except Exception as exc:                      # noqa: BLE001
-        log.warning("pdf ocr failed for %s: %s", req.asset_id, exc)
-        return ""
 
 
 # ---------------------------------------------------------------------------
 #  Word
 # ---------------------------------------------------------------------------
+def _ocr_space_call(data: bytes, req: ExtractRequest, label: str) -> tuple[str, str]:
+    """One OCR.space request for one chunk of PDF bytes. Never raises."""
+    try:
+        with httpx.Client(timeout=OCR_SPACE_TIMEOUT) as client:
+            r = client.post(
+                OCR_SPACE_URL,
+                headers={"apikey": OCR_SPACE_API_KEY},
+                files={"file": (req.name or "document.pdf", data, "application/pdf")},
+                data={
+                    # filetype overrides content-type sniffing, which the API
+                    # gets wrong often enough to be worth pinning explicitly.
+                    "filetype": "PDF",
+                    "OCREngine": OCR_SPACE_ENGINE,
+                    "language": OCR_SPACE_LANGUAGE,
+                    "isOverlayRequired": "false",
+                    "detectOrientation": "true",
+                    "scale": "true",
+                },
+            )
+        r.raise_for_status()
+        body = r.json()
+    except Exception as exc:                      # noqa: BLE001
+        log.warning("ocr.space request failed for %s %s: %s", req.asset_id, label, exc)
+        return "", f"request_failed: {exc}"[:120]
+
+    if body.get("IsErroredOnProcessing"):
+        msg = body.get("ErrorMessage") or body.get("ErrorDetails") or "unknown"
+        if isinstance(msg, list):
+            msg = "; ".join(str(m) for m in msg)
+        log.warning("ocr.space error for %s %s: %s", req.asset_id, label, msg)
+        return "", f"api_error: {msg}"[:120]
+
+    # One ParsedResults entry per page; join them in order.
+    pages = [str(p.get("ParsedText") or "")
+             for p in (body.get("ParsedResults") or [])]
+    text = "\n\n".join(t for t in pages if t.strip())
+    return text, "ok" if text.strip() else "no_text_found"
+
+
+def _split_pdf(data: bytes, req: ExtractRequest) -> list[tuple[bytes, str]]:
+    """Greedily group pages into sub-PDFs that fit OCR.space's limits.
+
+    Scanned PDFs are page images, so they run large - a 3-page scan routinely
+    clears the free tier's 1 MB ceiling. Splitting turns "too big, skipped
+    entirely" into several small requests that each succeed.
+
+    Two independent caps apply per request: byte size, and page count (the
+    free tier only reads the first few pages of any one PDF, so sending more
+    silently loses the rest).
+    """
+    from pypdf import PdfReader, PdfWriter
+
+    reader = PdfReader(io.BytesIO(data))
+    total = min(len(reader.pages), OCR_SPACE_MAX_PAGES)
+
+    chunks: list[tuple[bytes, str]] = []
+    writer = PdfWriter()
+    start = 0
+    count = 0
+
+    def flush(end: int) -> None:
+        nonlocal writer, count
+        if not count:
+            return
+        out = io.BytesIO()
+        writer.write(out)
+        chunks.append((out.getvalue(), f"pages {start + 1}-{end}"))
+        writer = PdfWriter()
+        count = 0
+
+    for i in range(total):
+        writer.add_page(reader.pages[i])
+        count += 1
+        probe = io.BytesIO()
+        writer.write(probe)
+        size = probe.tell()
+
+        if size > OCR_SPACE_MAX_BYTES and count > 1:
+            # Over budget: drop this page back out, emit what fits, and let
+            # the page start the next chunk instead.
+            writer = PdfWriter()
+            for j in range(start, i):
+                writer.add_page(reader.pages[j])
+            count = i - start
+            flush(i)
+            start = i
+            writer = PdfWriter()
+            writer.add_page(reader.pages[i])
+            count = 1
+        elif size > OCR_SPACE_MAX_BYTES:
+            # A single page that alone exceeds the limit - nothing to split.
+            log.warning("ocr.space: page %d of %s is %d bytes, over limit",
+                        i + 1, req.asset_id, size)
+            writer = PdfWriter()
+            count = 0
+            start = i + 1
+        elif count >= OCR_SPACE_MAX_PAGES_PER_REQUEST:
+            flush(i + 1)
+            start = i + 1
+
+    flush(total)
+    return chunks
+
+
+def _ocr_scanned_pdf(buf: io.BytesIO, req: ExtractRequest) -> tuple[str, str]:
+    """Send a scanned PDF to OCR.space, splitting it first if needed.
+
+    Never raises: OCR is a best-effort enrichment, and a failure here should
+    downgrade the result to 'scanned with no text', not fail the attachment.
+    """
+    if not OCR_SPACE_API_KEY:
+        return "", "not_configured"
+
+    buf.seek(0)
+    data = buf.read()
+
+    # Splitting loads the whole document into pypdf and serialises chunks from
+    # it, so it is only worth doing for files that comfortably fit in memory.
+    # Past this, the split itself would recreate the OOM problem OCR offloading
+    # was meant to solve - so decline rather than risk taking the worker down.
+    if len(data) > OCR_SPACE_SPLIT_MAX_BYTES:
+        del data
+        return "", "too_large_for_ocr"
+
+    try:
+        chunks = _split_pdf(data, req)
+    except Exception as exc:                      # noqa: BLE001
+        log.warning("pdf split failed for %s: %s", req.asset_id, exc)
+        # Fall back to sending it whole - it may still be under the limit.
+        chunks = [(data, "whole")] if len(data) <= OCR_SPACE_MAX_BYTES else []
+    finally:
+        del data
+
+    if not chunks:
+        return "", "too_large_for_ocr"
+
+    texts: list[str] = []
+    statuses: list[str] = []
+    for chunk_bytes, label in chunks:
+        text, status = _ocr_space_call(chunk_bytes, req, label)
+        if text:
+            texts.append(text)
+        statuses.append(status)
+        del chunk_bytes
+
+    if texts:
+        # Partial success still beats nothing: report ok when any chunk read,
+        # but keep the failing statuses visible rather than hiding them.
+        failed = [s for s in statuses if s != "ok"]
+        return ("\n\n".join(texts),
+                "ok" if not failed else f"partial: {failed[0]}"[:120])
+    return "", statuses[0] if statuses else "no_text_found"
+
+
 def extract_docx(buf: io.BytesIO, req: ExtractRequest) -> dict[str, Any]:
     import docx
 
@@ -357,93 +493,6 @@ def extract_pptx(buf: io.BytesIO, req: ExtractRequest) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-#  Images
-# ---------------------------------------------------------------------------
-def extract_image(buf: io.BytesIO, req: ExtractRequest) -> dict[str, Any]:
-    ocr_text, vision = "", ""
-
-    try:
-        import pytesseract
-        from PIL import Image
-
-        # Refuse absurd dimensions outright rather than letting PIL allocate
-        # first and fail second (decompression-bomb guard).
-        Image.MAX_IMAGE_PIXELS = 64_000_000
-
-        buf.seek(0)
-        with Image.open(buf) as img:
-            if img.mode not in ("RGB", "L"):
-                img = img.convert("RGB")
-
-            w, h = img.size
-            if w * h > MAX_OCR_PIXELS:
-                # thumbnail() resizes in place and never enlarges, so it is
-                # both the cheap and the safe way to land under the budget.
-                img.thumbnail((int(MAX_OCR_PIXELS ** 0.5), int(MAX_OCR_PIXELS ** 0.5)))
-            elif max(w, h) < 1000:
-                # Upscaling small screenshots measurably improves OCR on UI
-                # fonts - but only when the result stays inside the budget.
-                if (w * 2) * (h * 2) <= MAX_OCR_PIXELS:
-                    img = img.resize((w * 2, h * 2))
-
-            ocr_text = _clean(pytesseract.image_to_string(img))
-
-        # Tesseract returns punctuation soup on photos and gradients; drop
-        # anything without a run of real words rather than indexing noise.
-        if len(re.findall(r"[A-Za-z]{3,}", ocr_text)) < 3:
-            ocr_text = ""
-    except Exception as exc:                      # noqa: BLE001
-        log.warning("ocr failed for %s: %s", req.asset_id, exc)
-
-    if VISION_ENDPOINT and VISION_KEY:
-        try:
-            vision = _caption_image(buf, req)
-        except Exception as exc:                  # noqa: BLE001
-            log.warning("vision failed for %s: %s", req.asset_id, exc)
-
-    return {"status": "ok", "text": "", "ocr_text": ocr_text,
-            "ocr_chars": len(ocr_text), "vision_description": vision}
-
-
-def _caption_image(buf: io.BytesIO, req: ExtractRequest) -> str:
-    from PIL import Image
-
-    # Downscale and re-encode as JPEG before base64. Sending the original would
-    # hold the raw bytes, a base64 string ~33% larger, and the JSON payload
-    # containing it all at once - on a large PNG that is the single biggest
-    # allocation this service makes.
-    buf.seek(0)
-    small = io.BytesIO()
-    with Image.open(buf) as img:
-        if img.mode not in ("RGB", "L"):
-            img = img.convert("RGB")
-        if img.size[0] * img.size[1] > MAX_VISION_PIXELS:
-            side = int(MAX_VISION_PIXELS ** 0.5)
-            img.thumbnail((side, side))
-        img.convert("RGB").save(small, format="JPEG", quality=80, optimize=True)
-
-    b64 = base64.b64encode(small.getbuffer()).decode()
-    del small
-
-    payload = {
-        "temperature": 0,
-        "max_tokens": 400,
-        "messages": [{"role": "user", "content": [
-            {"type": "text", "text": VISION_PROMPT},
-            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
-        ]}],
-    }
-    del b64
-
-    with httpx.Client(timeout=120) as client:
-        r = client.post(VISION_ENDPOINT, json=payload,
-                        headers={"api-key": VISION_KEY,
-                                 "content-type": "application/json"})
-        r.raise_for_status()
-        return _clean(r.json()["choices"][0]["message"]["content"])
-
-
-# ---------------------------------------------------------------------------
 #  Plain text
 # ---------------------------------------------------------------------------
 def extract_text(buf: io.BytesIO, req: ExtractRequest) -> dict[str, Any]:
@@ -456,7 +505,6 @@ HANDLERS = {
     "document": extract_docx,
     "spreadsheet": extract_spreadsheet,
     "presentation": extract_pptx,
-    "image": extract_image,
     "text": extract_text,
 }
 
@@ -464,7 +512,8 @@ HANDLERS = {
 # ---------------------------------------------------------------------------
 @app.get("/health")
 def health() -> dict[str, Any]:
-    return {"ok": True, "handlers": sorted(HANDLERS), "vision": bool(VISION_ENDPOINT)}
+    return {"ok": True, "handlers": sorted(HANDLERS),
+            "pdf_ocr": "ocr.space" if OCR_SPACE_API_KEY else "disabled"}
 
 
 class _TooBig(Exception):
